@@ -125,7 +125,7 @@ def main():
     ap.add_argument("--dataset", type=str, required=True)
     ap.add_argument("--train_sample", type=int, default=None)
     ap.add_argument("--do_train", type=str, default="train", choices=["train", "saved_weight"])
-    ap.add_argument("--loss_mode", type=str, default="combined")
+    ap.add_argument("--loss_mode", type=str, default="combined", choices=["baseline", "combined"])
     ap.add_argument("--lambda_kl", type=float, default=1.0)
     ap.add_argument("--temp", type=float, default=5.0)
     ap.add_argument("--lr", type=float, default=5e-6)
