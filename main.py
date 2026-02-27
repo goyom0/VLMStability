@@ -158,6 +158,3 @@ if __name__ == "__main__":
         pass
     main()
 
-
-# CUDA_VISIBLE_DEVICES=1 python instruct_main_seq.py --outdir /data/user/dahyoun/VLM/results/rollout/token_kl_lam1 --dataset NaturalBenchDataset --train_sample 4000 --do_train train  --loss_mode combined --lambda_kl 1
-
