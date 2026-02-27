@@ -233,7 +233,6 @@ class StabilityDataset(Dataset):
 
 
 def stability_collate_fn(batch, processor):
-
     def merge_features(input_dicts):
         # text
         text_features = [
@@ -365,14 +364,10 @@ class StabilityEvaluator():
         self.dataset = dataset
         self.model_name = model_name
         self.model_type = model_type
-        #self.base_path = f"/data/user/dahyoun/VLM/data"
-        #self.img_dir = os.path.join(self.base_path, "train2017", f"{dataset}")
         self.tr_df = tr_df
         self.samples_df = ts_df
         self.seed = 0
 
-        self.model = None
-        self.processor = None        
         self.client = None
         self.tokenizer = None
                 
@@ -397,24 +392,20 @@ class StabilityEvaluator():
             }
             for d in input_dicts
         ]
-
         collated = self.processor.tokenizer.pad(
             text_features,
             return_tensors="pt"
         )
-
         if "pixel_values" in input_dicts[0]:
             collated["pixel_values"] = torch.cat(
                 [d["pixel_values"] for d in input_dicts],
                 dim=0
             )
-
         if "image_grid_thw" in input_dicts[0]:
             collated["image_grid_thw"] = torch.cat(
                 [d["image_grid_thw"] for d in input_dicts],
                 dim=0
             )
-
         return collated
 
     
