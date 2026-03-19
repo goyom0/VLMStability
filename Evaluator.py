@@ -415,67 +415,101 @@ class StabilityEvaluator():
         student_model,
         origin_inputs,
         pert_inputs,
-        labels_full,
         temp=1.0,
         estimator_type="full_kl",
         kl_direction="forward",
         topk=None,
     ):
-
+        """
+        On-policy token KL loss:
+        1. student가 perturbed 이미지 보고 직접 generate() --> rollout
+        2. rollout 시퀀스 위에서 student(perturbed) vs teacher(original) logit 비교
+        """
         device = origin_inputs["input_ids"].device
-
-        # ----- Teacher -----
-        with torch.no_grad():
-            t_outputs = teacher_model(**origin_inputs)
-            t_logits = t_outputs.logits.to(torch.bfloat16)
-
-        # ----- Student -----
         B = origin_inputs["input_ids"].size(0)
-
+ 
         if pert_inputs["input_ids"].size(0) != B:
             for k, v in pert_inputs.items():
                 if isinstance(v, torch.Tensor):
                     pert_inputs[k] = v.repeat(B, *([1] * (v.dim() - 1)))
-
-        s_inputs = {
-            "input_ids": origin_inputs["input_ids"],
-            "attention_mask": origin_inputs["attention_mask"],
+ 
+        # ----- student(perturbed)가 on-policy rollout 생성 -----
+        # origin text 토큰(질문 부분)만 prompt로 사용 (GT 답변 제외)
+        prompt_inputs = {
+            "input_ids": pert_inputs["input_ids"],
+            "attention_mask": pert_inputs["attention_mask"],
             "pixel_values": pert_inputs["pixel_values"],
             "image_grid_thw": pert_inputs["image_grid_thw"],
         }
-
+ 
+        with torch.no_grad():
+            rollout_ids = student_model.generate(
+                **prompt_inputs,
+                max_new_tokens=20,
+                do_sample=True,
+                temperature=1.0,
+                use_cache=True,
+            )
+        # rollout_ids: [B, prompt_len + generated_len]
+        prompt_len = prompt_inputs["input_ids"].size(1)
+        generated_len = rollout_ids.size(1) - prompt_len
+ 
+        if generated_len <= 0:
+            return torch.tensor(0.0, device=device, requires_grad=True)
+ 
+        # rollout attention mask
+        rollout_attention_mask = torch.ones_like(rollout_ids)
+ 
+        # ----- student(perturbed)가 rollout 시퀀스 위에서 logit 계산 -----
+        s_rollout_inputs = {
+            "input_ids": rollout_ids,
+            "attention_mask": rollout_attention_mask,
+            "pixel_values": pert_inputs["pixel_values"],
+            "image_grid_thw": pert_inputs["image_grid_thw"],
+        }
         with torch.amp.autocast('cuda', dtype=torch.bfloat16):
-            s_outputs = student_model(**s_inputs)
-            s_logits = s_outputs.logits
-
-        t_logits = t_logits[:, :-1, :] / temp
-        s_logits = s_logits[:, :-1, :] / temp
-
-        labels_full = labels_full[:, :t_logits.size(1) + 1]
-        kl_mask = (labels_full[:, 1:] != -100)
-
-        common_len = min(t_logits.size(1), s_logits.size(1), kl_mask.size(1))
-
-        t_logits = t_logits[:, :common_len]
+            s_outputs = student_model(**s_rollout_inputs)
+            s_logits = s_outputs.logits 
+ 
+        # ----- teacher(original)가 동일한 rollout 시퀀스 위에서 logit 계산 -----
+        # origin 이미지 + rollout 텍스트
+        t_rollout_inputs = {
+            "input_ids": rollout_ids,
+            "attention_mask": rollout_attention_mask,
+            "pixel_values": origin_inputs["pixel_values"],
+            "image_grid_thw": origin_inputs["image_grid_thw"],
+        }
+        with torch.no_grad():
+            t_outputs = teacher_model(**t_rollout_inputs)
+            t_logits = t_outputs.logits.to(torch.bfloat16)
+ 
+        # ----- generated 토큰 위치에서만 KL 계산 -----
+        # shift: logit[i] --> token[i+1] 예측
+        # generated 토큰은 prompt_len 이후부터
+        s_logits = s_logits[:, prompt_len - 1:-1, :] / temp
+        t_logits = t_logits[:, prompt_len - 1:-1, :] / temp
+ 
+        common_len = min(s_logits.size(1), t_logits.size(1))
         s_logits = s_logits[:, :common_len]
-        kl_mask = kl_mask[:, :common_len]
-
-        t_selected = t_logits[kl_mask]
-        s_selected = s_logits[kl_mask]
-
-        # top-k 먼저 적용
-        if topk is not None and topk < t_selected.size(-1):
-            values, idx = torch.topk(t_selected, k=topk, dim=-1)
-            t_selected = values
-            s_selected = torch.gather(s_selected, -1, idx)
-
+        t_logits = t_logits[:, :common_len]
+ 
+        # flatten
+        s_logits = s_logits.reshape(-1, s_logits.size(-1))
+        t_logits = t_logits.reshape(-1, t_logits.size(-1))
+ 
+        # top-k 적용
+        if topk is not None and topk < t_logits.size(-1):
+            values, idx = torch.topk(t_logits, k=topk, dim=-1)
+            t_logits = values
+            s_logits = torch.gather(s_logits, -1, idx)
+ 
         # ----- prob -----
-        t_log_probs = F.log_softmax(t_selected, dim=-1)
-        s_log_probs = F.log_softmax(s_selected, dim=-1)
-
+        t_log_probs = F.log_softmax(t_logits, dim=-1)
+        s_log_probs = F.log_softmax(s_logits, dim=-1)
+ 
         t_probs = t_log_probs.exp().detach()
         s_probs = s_log_probs.exp()
-  
+ 
         # ----- KL -----
         if estimator_type == "full_kl":
             if kl_direction == "forward":
@@ -484,33 +518,34 @@ class StabilityEvaluator():
                     t_probs,
                     reduction="batchmean"
                 ) * (temp ** 2)
-
             elif kl_direction == "reverse":
                 kl_loss = (s_probs * (s_log_probs - t_log_probs)).sum(-1).mean()
-
+ 
         elif estimator_type == "k3":
             log_ratio = s_log_probs - t_log_probs
             kl_loss = (torch.exp(log_ratio) - 1 - log_ratio).mean() * (temp ** 2)
-
+ 
         return kl_loss
-
-
-
+ 
+ 
+ 
     def _mc_token_jsd_loss(
         self,
         model,
         origin_logits,
         origin_inputs,
         pert_inputs,
-        labels_full,
         temp=1.0,
         topk=256,
     ):
-
-        logits_origin = origin_logits[:, :-1, :] / temp
-
+        """
+        On-policy token JSD loss:
+        1. student가 perturbed 이미지 보고 직접 generate() --> rollout
+        2. rollout 위에서 student(original) vs student(perturbed) logit 비교
+        """
+        device = origin_inputs["input_ids"].device
         B = origin_inputs["input_ids"].size(0)
-
+ 
         if pert_inputs["input_ids"].size(0) != B:
             for k, v in pert_inputs.items():
                 if not isinstance(v, torch.Tensor):
@@ -519,52 +554,81 @@ class StabilityEvaluator():
                     pert_inputs[k] = v.repeat(B, *([1] * (v.dim() - 1)))
                 else:
                     pert_inputs[k] = v.expand(B, *v.shape[1:])
-
-        s_inputs = {
-            "input_ids": origin_inputs["input_ids"],
-            "attention_mask": origin_inputs["attention_mask"],
+ 
+        # ----- student(perturbed)가 on-policy rollout 생성 -----
+        prompt_inputs = {
+            "input_ids": pert_inputs["input_ids"],
+            "attention_mask": pert_inputs["attention_mask"],
             "pixel_values": pert_inputs["pixel_values"],
             "image_grid_thw": pert_inputs["image_grid_thw"],
         }
-
-        out_pert = model(**s_inputs)
-        logits_pert = out_pert.logits[:, :-1, :] / temp
-
-        shift_labels = labels_full[:, 1:]
-        common_len = min(logits_origin.size(1), logits_pert.size(1), shift_labels.size(1))
-
-        logits_origin = logits_origin[:, :common_len]
-        logits_pert = logits_pert[:, :common_len]
-        shift_labels = shift_labels[:, :common_len]
-
-        mask = (shift_labels != -100)
-
-        if mask.sum() == 0:
-            return logits_origin.sum() * 0.0
-
-        o_sel = logits_origin[mask]
-        p_sel = logits_pert[mask]
-
-        # top-k 먼저 적용
-        if topk is not None and topk < o_sel.size(-1):
-            values, idx = torch.topk(o_sel, k=topk, dim=-1)
-            o_sel = values
-            p_sel = torch.gather(p_sel, -1, idx)
-
-        logP = F.log_softmax(o_sel, dim=-1)
-        logQ = F.log_softmax(p_sel, dim=-1)
-
+ 
+        with torch.no_grad():
+            rollout_ids = model.generate(
+                **prompt_inputs,
+                max_new_tokens=20,
+                do_sample=True,
+                temperature=1.0,
+                use_cache=True,
+            )
+ 
+        prompt_len = prompt_inputs["input_ids"].size(1)
+        generated_len = rollout_ids.size(1) - prompt_len
+ 
+        if generated_len <= 0:
+            return origin_logits.sum() * 0.0
+ 
+        rollout_attention_mask = torch.ones_like(rollout_ids)
+ 
+        # ----- student logit -----
+        s_pert_inputs = {
+            "input_ids": rollout_ids,
+            "attention_mask": rollout_attention_mask,
+            "pixel_values": pert_inputs["pixel_values"],
+            "image_grid_thw": pert_inputs["image_grid_thw"],
+        }
+        out_pert = model(**s_pert_inputs)
+        logits_pert = out_pert.logits[:, prompt_len - 1:-1, :] / temp  
+ 
+        # ----- student(original) logit -----
+        s_orig_inputs = {
+            "input_ids": rollout_ids,
+            "attention_mask": rollout_attention_mask,
+            "pixel_values": origin_inputs["pixel_values"],
+            "image_grid_thw": origin_inputs["image_grid_thw"],
+        }
+        with torch.no_grad():
+            out_orig = model(**s_orig_inputs)
+        logits_origin = out_orig.logits[:, prompt_len - 1:-1, :].detach() / temp
+ 
+        # ----- generated 토큰 위치에서 JSD 계산 -----
+        common_len = min(logits_origin.size(1), logits_pert.size(1))
+        logits_origin = logits_origin[:, :common_len].reshape(-1, logits_origin.size(-1))
+        logits_pert = logits_pert[:, :common_len].reshape(-1, logits_pert.size(-1))
+ 
+        if logits_origin.size(0) == 0:
+            return origin_logits.sum() * 0.0
+ 
+        # top-k 적용
+        if topk is not None and topk < logits_origin.size(-1):
+            values, idx = torch.topk(logits_origin, k=topk, dim=-1)
+            logits_origin = values
+            logits_pert = torch.gather(logits_pert, -1, idx)
+ 
+        logP = F.log_softmax(logits_origin, dim=-1)
+        logQ = F.log_softmax(logits_pert, dim=-1)
+ 
         P = logP.exp()
         Q = logQ.exp()
-
+ 
         M = 0.5 * (P + Q)
         logM = torch.log(M + 1e-10)
-
+ 
         jsd = 0.5 * (
             (P * (logP - logM)).sum(-1) +
             (Q * (logQ - logM)).sum(-1)
         )
-
+ 
         return jsd.mean()
 
 
@@ -746,22 +810,20 @@ class StabilityEvaluator():
                                     if kl_mode == "token_jsd":
                                         student_logits_detached = student_logits.detach()
                                         loss_kl = self._mc_token_jsd_loss(
-                                            model=model,
+                                            model=unwrapped_model,
                                             origin_logits=student_logits_detached,
                                             origin_inputs=origin,
                                             pert_inputs=sub_pert,
-                                            labels_full=labels_full,
                                             temp=temp,
                                             topk=topk,
                                         )
 
                                     elif kl_mode == "token_kl":
                                         loss_kl = self._mc_token_kl_ema_loss(
-                                            ema_teacher.model,
-                                            model,
-                                            origin,
-                                            sub_pert,
-                                            labels_full,
+                                            teacher_model=ema_teacher.model,
+                                            student_model=unwrapped_model,
+                                            origin_inputs=origin,
+                                            pert_inputs=sub_pert,
                                             temp=temp,
                                             estimator_type=estimator_type,
                                             kl_direction=kl_direction,
