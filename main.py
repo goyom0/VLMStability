@@ -70,19 +70,19 @@ def run_single_model(dataset_name, train_df, test_df, model_name, outdir, args):
         if args.do_train == "train":
             train_set = StabilityDataset(train_df, evaluator.processor, evaluator.model)
             custom_collate = partial(stability_collate_fn, processor=evaluator.processor)
-            
+
             sampler = ImageBatchSampler(train_set, args.batch_size)
             train_loader = DataLoader(
                 train_set,
                 batch_sampler=sampler,
                 collate_fn=custom_collate,
-                num_workers=0
+                num_workers=0,
+                pin_memory=True,
             )
-            
+
             save_path = os.path.join(outdir, f"checkpoints/{model_name.split('/')[-1]}")
             optimizer = bnb.optim.AdamW8bit(evaluator.model.parameters(), lr=args.lr)
 
-            # _train 내부에서 accelerator.prepare(), EMA 업데이트 수행
             evaluator._train(
                 model=evaluator.model,
                 train_loader=train_loader,
@@ -92,20 +92,69 @@ def run_single_model(dataset_name, train_df, test_df, model_name, outdir, args):
                 lambda_kl=args.lambda_kl,
                 temp=args.temp,
                 kl_mode=args.kl_mode,
-                estimator_type=args.estimator_type
+                estimator_type=args.estimator_type,
+                kl_direction=args.kl_direction,
+                topk=256,
             )
 
-        # 평가
+        elif args.do_train == "saved_weight":
+            checkpoint_path = os.path.join(outdir, f"checkpoints/{model_name.split('/')[-1]}/{args.kl_mode}")
+            if os.path.exists(checkpoint_path):
+                print(f">>> Loading trained weights from: {checkpoint_path}")
+                from transformers import AutoProcessor, AutoModelForImageTextToText, AutoConfig
+                import torch
+                config = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
+
+                if evaluator.model is not None:
+                    del evaluator.model
+                    torch.cuda.empty_cache()
+                # processor는 원본 모델에서 로드
+                evaluator.processor = AutoProcessor.from_pretrained(
+                    model_name,
+                    trust_remote_code=True
+                )
+                evaluator.model = AutoModelForImageTextToText.from_pretrained(
+                    checkpoint_path,
+                    config=config,
+                    torch_dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16,
+                    trust_remote_code=True,
+                    device_map="auto"
+                ).eval()
+                from accelerate.hooks import remove_hook_from_module
+                remove_hook_from_module(evaluator.model)
+
+            else:
+                print(f"!!! Warning: No checkpoint found at {checkpoint_path}. Using baseline.")
+
+
+        print(f"--- [EVAL] Running evaluation with TRAINED model: {model_name} ---")
+        p = "visual"
+        safe_model_name = model_name.split("/")[-1]
+        suffix = f"_{args.loss_mode}"
+        rank = accelerator.local_process_index
+
+        # 각 rank가 독립적으로 실행 후 자기 파일 저장
+        result_df = evaluator.run_evaluation_multi(perturbation_type=p)
+        if result_df is not None and len(result_df) > 0:
+            tmp_file = f"{outdir}/{safe_model_name}_{p}{suffix}_rank{rank}.csv"
+            result_df.to_csv(tmp_file, index=False)
+            print(f"[rank{rank}] Saved: {tmp_file}")
+
+        # rank0이 폴링으로 모든 파일 모아서 merge
         if accelerator.is_main_process:
-            print(f"--- [EVAL] Running evaluation with TRAINED model: {model_name} ---")
-            p = 'visual'
-            result_df = evaluator.run_evaluation(perturbation_type=p)
-            if len(result_df) > 0:
-                safe_model_name = model_name.split('/')[-1]
-                suffix = f"_{args.loss_mode}" if args.do_train == "train" else "_baseline"
-                out_file = f"{outdir}/{safe_model_name}_{p}{suffix}_results.csv"
-                result_df.to_csv(out_file, index=False)
-                print(f"Saved results: {out_file}")
+            import time, glob
+            world_size = int(os.environ.get("WORLD_SIZE", 1))
+            for _ in range(720): 
+                files = sorted(glob.glob(f"{outdir}/{safe_model_name}_{p}{suffix}_rank*.csv"))
+                if len(files) >= world_size:
+                    break
+                time.sleep(5)
+            files = sorted(glob.glob(f"{outdir}/{safe_model_name}_{p}{suffix}_rank*.csv"))
+            if files:
+                final_df = pd.concat([pd.read_csv(f) for f in files], ignore_index=True)
+                out_file = f"{outdir}/{safe_model_name}_{p}{suffix}_results_merged.csv"
+                final_df.to_csv(out_file, index=False)
+                print(f"Saved merged results: {out_file}")
 
     except Exception as e:
         if accelerator.is_main_process:
@@ -134,15 +183,15 @@ def main():
     ap.add_argument("--estimator_type", type=str, default="k1", choices=["full_kl", "k3"])
 
     args = ap.parse_args()
-    outdir = os.path.join(args.outdir, args.dataset)
+    outdir = args.outdir
     os.makedirs(outdir, exist_ok=True)
     
     model_name = "Qwen/Qwen2.5-VL-3B-Instruct"
 
     # COCO
-    train_df = pd.read_csv("/data/user/dahyoun/VLM/data/coco_dataset_new_2.tsv", sep='\t', on_bad_lines='skip')
+    train_df = pd.read_csv("/data/path/coco_dataset_new_2.tsv", sep='\t', on_bad_lines='skip')
     # NaturalBenchDataset
-    test_df = pd.read_csv(f"/data/user/dahyoun/VLM/data/{args.dataset}_w_sensitivity.tsv", sep='\t', on_bad_lines='skip')
+    test_df = pd.read_csv(f"/data/path/{args.dataset}_w_sensitivity.tsv", sep='\t', on_bad_lines='skip')
 
     if args.train_sample is not None:
         sampled_images = train_df["image"].drop_duplicates().sample(n=args.train_sample, random_state=42)
