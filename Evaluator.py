@@ -412,28 +412,31 @@ class StabilityEvaluator():
     def _mc_token_kl_ema_loss(
         self,
         teacher_model,
-        # student_logits,   # CE에서 나온 logits 재사용할 경우
         student_model,
         origin_inputs,
         pert_inputs,
         labels_full,
         temp=1.0,
         estimator_type="full_kl",
+        kl_direction="forward",
         topk=None,
     ):
-        """
-        Token-level KL aligned exactly with CE mask.
-        KL is applied only on answer tokens (same positions as CE).
-        """
 
         device = origin_inputs["input_ids"].device
 
-        # Teacher
+        # ----- Teacher -----
         with torch.no_grad():
             t_outputs = teacher_model(**origin_inputs)
-            t_logits = t_outputs.logits  # [B, T, V]
+            t_logits = t_outputs.logits.to(torch.bfloat16)
 
-        # Student (same text, perturbed image only)
+        # ----- Student -----
+        B = origin_inputs["input_ids"].size(0)
+
+        if pert_inputs["input_ids"].size(0) != B:
+            for k, v in pert_inputs.items():
+                if isinstance(v, torch.Tensor):
+                    pert_inputs[k] = v.repeat(B, *([1] * (v.dim() - 1)))
+
         s_inputs = {
             "input_ids": origin_inputs["input_ids"],
             "attention_mask": origin_inputs["attention_mask"],
@@ -441,52 +444,128 @@ class StabilityEvaluator():
             "image_grid_thw": pert_inputs["image_grid_thw"],
         }
 
-        if "image_grid_thw" in pert_inputs:
-            s_inputs["image_grid_thw"] = pert_inputs["image_grid_thw"]
-
-        # s_logits = student_logits
         with torch.amp.autocast('cuda', dtype=torch.bfloat16):
-            s_outputs = student_model(**s_inputs)   # labels 없이 forward
+            s_outputs = student_model(**s_inputs)
             s_logits = s_outputs.logits
 
-        # ----- Next-token alignment (same as CE) -----
         t_logits = t_logits[:, :-1, :] / temp
         s_logits = s_logits[:, :-1, :] / temp
 
-        # CE와 동일한 위치 마스크
-        # labels_full shape: [B, T]
         labels_full = labels_full[:, :t_logits.size(1) + 1]
         kl_mask = (labels_full[:, 1:] != -100)
 
-        if kl_mask.sum() == 0:
-            return torch.tensor(0.0, device=device, requires_grad=True)
+        common_len = min(t_logits.size(1), s_logits.size(1), kl_mask.size(1))
 
-        # ----- Select only answer token positions -----
-        t_selected = t_logits[kl_mask] 
+        t_logits = t_logits[:, :common_len]
+        s_logits = s_logits[:, :common_len]
+        kl_mask = kl_mask[:, :common_len]
+
+        t_selected = t_logits[kl_mask]
         s_selected = s_logits[kl_mask]
 
-        # Top-K 사용할 경우
+        # top-k 먼저 적용
         if topk is not None and topk < t_selected.size(-1):
-            k = min(topk, t_selected.size(-1))
-            _, topk_idx = torch.topk(t_selected, k=k, dim=-1)
-            t_selected = torch.gather(t_selected, dim=-1, index=topk_idx)
-            s_selected = torch.gather(s_selected, dim=-1, index=topk_idx)
+            values, idx = torch.topk(t_selected, k=topk, dim=-1)
+            t_selected = values
+            s_selected = torch.gather(s_selected, -1, idx)
 
-        if estimator_type == "k3":
-            log_p = F.log_softmax(t_selected, dim=-1)
-            log_q = F.log_softmax(s_selected, dim=-1)
-            log_ratio = log_q - log_p
+        # ----- prob -----
+        t_log_probs = F.log_softmax(t_selected, dim=-1)
+        s_log_probs = F.log_softmax(s_selected, dim=-1)
+
+        t_probs = t_log_probs.exp().detach()
+        s_probs = s_log_probs.exp()
+  
+        # ----- KL -----
+        if estimator_type == "full_kl":
+            if kl_direction == "forward":
+                kl_loss = F.kl_div(
+                    s_log_probs,
+                    t_probs,
+                    reduction="batchmean"
+                ) * (temp ** 2)
+
+            elif kl_direction == "reverse":
+                kl_loss = (s_probs * (s_log_probs - t_log_probs)).sum(-1).mean()
+
+        elif estimator_type == "k3":
+            log_ratio = s_log_probs - t_log_probs
             kl_loss = (torch.exp(log_ratio) - 1 - log_ratio).mean() * (temp ** 2)
-        else:
-            t_probs = F.softmax(t_selected, dim=-1)
-            s_log_probs = F.log_softmax(s_selected, dim=-1)
-            kl_loss = F.kl_div(
-                s_log_probs,
-                t_probs,
-                reduction="batchmean"
-            ) * (temp ** 2)
 
         return kl_loss
+
+
+
+    def _mc_token_jsd_loss(
+        self,
+        model,
+        origin_logits,
+        origin_inputs,
+        pert_inputs,
+        labels_full,
+        temp=1.0,
+        topk=256,
+    ):
+
+        logits_origin = origin_logits[:, :-1, :] / temp
+
+        B = origin_inputs["input_ids"].size(0)
+
+        if pert_inputs["input_ids"].size(0) != B:
+            for k, v in pert_inputs.items():
+                if not isinstance(v, torch.Tensor):
+                    continue
+                if k in ["pixel_values", "image_grid_thw"]:
+                    pert_inputs[k] = v.repeat(B, *([1] * (v.dim() - 1)))
+                else:
+                    pert_inputs[k] = v.expand(B, *v.shape[1:])
+
+        s_inputs = {
+            "input_ids": origin_inputs["input_ids"],
+            "attention_mask": origin_inputs["attention_mask"],
+            "pixel_values": pert_inputs["pixel_values"],
+            "image_grid_thw": pert_inputs["image_grid_thw"],
+        }
+
+        out_pert = model(**s_inputs)
+        logits_pert = out_pert.logits[:, :-1, :] / temp
+
+        shift_labels = labels_full[:, 1:]
+        common_len = min(logits_origin.size(1), logits_pert.size(1), shift_labels.size(1))
+
+        logits_origin = logits_origin[:, :common_len]
+        logits_pert = logits_pert[:, :common_len]
+        shift_labels = shift_labels[:, :common_len]
+
+        mask = (shift_labels != -100)
+
+        if mask.sum() == 0:
+            return logits_origin.sum() * 0.0
+
+        o_sel = logits_origin[mask]
+        p_sel = logits_pert[mask]
+
+        # top-k 먼저 적용
+        if topk is not None and topk < o_sel.size(-1):
+            values, idx = torch.topk(o_sel, k=topk, dim=-1)
+            o_sel = values
+            p_sel = torch.gather(p_sel, -1, idx)
+
+        logP = F.log_softmax(o_sel, dim=-1)
+        logQ = F.log_softmax(p_sel, dim=-1)
+
+        P = logP.exp()
+        Q = logQ.exp()
+
+        M = 0.5 * (P + Q)
+        logM = torch.log(M + 1e-10)
+
+        jsd = 0.5 * (
+            (P * (logP - logM)).sum(-1) +
+            (Q * (logQ - logM)).sum(-1)
+        )
+
+        return jsd.mean()
 
 
 
@@ -617,7 +696,6 @@ class StabilityEvaluator():
                     # perturbed loop + KL/JSD (Roll-out)
                     # ==============================
                     perturbed_raw_list = batch['perturbed_list_raw']
-                    perturb_owner_idx = batch['perturb_owner_idx']
                     num_pert = len(perturbed_raw_list)
                     
                     # 각 GPU에서 계산된 KL 값 합산
@@ -648,144 +726,130 @@ class StabilityEvaluator():
                             print(f"\nDEBUG: Response Start Index = {response_start_idx}")
                             print(f"DEBUG: Total Sequence Length = {origin['input_ids'].size(1)}")
 
-                        for i in range(0, num_pert, sub_bs):
-                            sub_list = perturbed_raw_list[i:i + sub_bs]
-                            sub_pert_dict = self._merge_sub_batch(sub_list)
-                            sub_pert = {k: v.to(device)
-                                        for k, v in sub_pert_dict.items()
-                                        if isinstance(v, torch.Tensor)}
+                        MAX_PERT = 36  # 최대 perturbation 수
 
-                            with torch.amp.autocast('cuda', dtype=torch.bfloat16):
-                                # ---------- token_jsd (Roll-out) ----------
-                                if kl_mode == "token_jsd":
-                                    # origin_sampling forward (question only)
-                                    out_origin = model(**origin_sampling)
-                                    logits_origin = out_origin.logits[:, :-1, :] / temp
+                        for i in range(MAX_PERT):
 
-                                    # perturbed forward (question only)
-                                    out_pert = model(**sub_pert)
-                                    logits_pert = out_pert.logits[:, :-1, :] / temp
+                            if i < num_pert:
 
-                                    # 공통 길이 정렬
-                                    common_len = min(logits_origin.size(1), logits_pert.size(1))
-                                    logits_origin = logits_origin[:, :common_len, :]
-                                    logits_pert   = logits_pert[:, :common_len, :]
+                                sub_list = perturbed_raw_list[i:i + sub_bs]
+                                sub_pert_dict = self._merge_sub_batch(sub_list)
 
-                                    # attention mask 기반 valid token 마스크
-                                    mask_origin = origin_sampling["attention_mask"][:, 1:1+common_len]
-                                    mask_pert = sub_pert["attention_mask"][:, 1:1+common_len]
+                                sub_pert = {
+                                    k: v.to(device)
+                                    for k, v in sub_pert_dict.items()
+                                    if isinstance(v, torch.Tensor)
+                                }
 
-                                    mask = (mask_origin & mask_pert).bool()
+                                with torch.amp.autocast("cuda", dtype=torch.bfloat16):
 
-                                    if mask.sum() == 0:
-                                        loss_kl = torch.tensor(0.0, device=device, requires_grad=True)
-                                    else:
-                                        P = F.softmax(logits_origin[mask], dim=-1)
-                                        Q = F.softmax(logits_pert[mask], dim=-1)
-
-                                        M = 0.5 * (P + Q)
-
-                                        jsd = 0.5 * (
-                                            (P * (torch.log(P + 1e-10) - torch.log(M + 1e-10))).sum(-1) +
-                                            (Q * (torch.log(Q + 1e-10) - torch.log(M + 1e-10))).sum(-1)
+                                    if kl_mode == "token_jsd":
+                                        student_logits_detached = student_logits.detach()
+                                        loss_kl = self._mc_token_jsd_loss(
+                                            model=model,
+                                            origin_logits=student_logits_detached,
+                                            origin_inputs=origin,
+                                            pert_inputs=sub_pert,
+                                            labels_full=labels_full,
+                                            temp=temp,
+                                            topk=topk,
                                         )
 
-                                        loss_kl = jsd.mean()
-                                
-                                # ---------- token_kl (exact kl/k3 Roll-out) ----------
-                                elif kl_mode == "token_kl":
-                                    # response_start_idx를 사용하도록 전달
-                                    loss_kl = self._mc_token_kl_ema_loss(
-                                        ema_teacher.model,
-                                        # student_logits,   # forward 재사용
-                                        model,
-                                        origin,
-                                        sub_pert,
-                                        labels_full,
-                                        temp=temp,
-                                        estimator_type=estimator_type,
-                                        topk=256  # OOM 방지
-                                    )
+                                    elif kl_mode == "token_kl":
+                                        loss_kl = self._mc_token_kl_ema_loss(
+                                            ema_teacher.model,
+                                            model,
+                                            origin,
+                                            sub_pert,
+                                            labels_full,
+                                            temp=temp,
+                                            estimator_type=estimator_type,
+                                            kl_direction=kl_direction,
+                                            topk=topk,
+                                        )
 
-                                # loss_kl이 nan일 경우 방어
-                                if not math.isnan(loss_kl.item()):
-                                    kl_scale = num_pert / sub_bs
-                                    total_kl_loss = total_kl_loss + (loss_kl / kl_scale)
-                                    # total_kl_loss = total_kl_loss + (loss_kl.detach() / kl_scale)
-                                    local_kl_sum += loss_kl.item() / kl_scale
+                                    if not torch.isfinite(loss_kl):
+                                        loss_kl = torch.zeros_like(loss_kl)
 
-                            del sub_pert
+                            else:
+                                # GPU마다 perturbation 개수가 달라도 backward 횟수를 맞추기 위한 dummy loss
+                                # loss_kl = torch.zeros(1, device=device, requires_grad=True)
+                                loss_kl = student_logits.sum() * 0.0
 
-                        # 모든 GPU의 KL 값 평균 계산
-                        kl_tensor = torch.tensor(local_kl_sum).to(device)
-                        cur_kl_val = accelerator.reduce(kl_tensor, reduction='mean').item()
+                            kl_scale = MAX_PERT
+                            scaled_kl = lambda_kl * auto_factor * loss_kl / kl_scale
 
-                    if loss_mode == "combined":
-                        # CE 로스 + (스케일링 팩터 * KL loss)
-                        final_loss = loss_ce + (lambda_kl * auto_factor * total_kl_loss)
-                    elif loss_mode == "kl_only":
-                        final_loss = lambda_kl * auto_factor * total_kl_loss
-                    elif loss_mode == "baseline":
-                        final_loss = loss_ce
-                        auto_factor=1.0
+                            # perturbation마다 backward 
+                            accelerator.backward(scaled_kl)
 
-                    accelerator.backward(final_loss)
+                            if i < num_pert:
+                                local_kl_sum += scaled_kl.detach().float().item()
+
+                            if i < num_pert:
+                                del sub_pert
+                                del loss_kl
+
+                    # ---- CE backward는 마지막에 1번만 ----
+                    if loss_mode != "kl_only":
+                        accelerator.backward(loss_ce)
 
                     if accelerator.sync_gradients:
                         accelerator.clip_grad_norm_(model.parameters(), 5.0)
 
                     optimizer.step()
                     optimizer.zero_grad()
-                    
-                    if loss_mode is not 'baseline' and accelerator.sync_gradients:
-                        ema_teacher.update(model, accelerator)
+
+                    if loss_mode != 'baseline' and accelerator.sync_gradients:
+                        accelerator.wait_for_everyone()
+                        ema_teacher.update(accelerator.unwrap_model(model), accelerator)
+                        accelerator.wait_for_everyone()  # update 후에도 barrier 추가
+
                     global_step += 1
 
-                # calibration 및 로깅
-                if accelerator.is_main_process:
+                    cur_kl_val = local_kl_sum
+
                     if count < calibration_steps:
                         sum_ce += cur_ce_val
-                        # sum_kl이 0이 되지 않도록 보정
-                        sum_kl += max(abs(cur_kl_val), 1e-6) 
+                        # sum_kl이 0이 되지 않도록 아주 작은 값(1e-6) 보정
+                        sum_kl += max(abs(cur_kl_val), 1e-6)
                         count += 1
-                        if count == calibration_steps:
-                            # factor 폭증 방지
-                            raw_factor = sum_ce / (sum_kl + 1e-8)
-                            auto_factor = min(raw_factor, 100000.0) 
+
+                        if count == calibration_steps and accelerator.is_main_process:
+                            raw_factor = sum_ce / (sum_kl + 1e-3)
+                            auto_factor = min(raw_factor, 1000.0)
                             print(f"\n>>> [CALIBRATION DONE] Factor Clamped: {raw_factor:.2f} -> {auto_factor:.2f}")
 
-                    total_loss = cur_ce_val + auto_factor * cur_kl_val
-                    wandb.log({"ce_loss": cur_ce_val, "kl_loss": cur_kl_val, 
-                                "scaling_factor": auto_factor, "total_loss": total_loss}, 
-                                step=global_step)        
+                    total_loss = cur_ce_val + cur_kl_val
+                    if accelerator.is_main_process:
+                        wandb.log(
+                            {
+                                "ce_loss": cur_ce_val,
+                                "kl_loss": cur_kl_val,
+                                "scaling_factor": auto_factor,
+                                "total_loss": total_loss,
+                            },
+                            step=global_step,
+                        )
                     if (batch_idx + 1) % accumulation_steps == 0:
                         print(f"\n[Step {batch_idx+1}] Loss: {total_loss:.4f} (CE: {cur_ce_val:.4f}, KL: {cur_kl_val:.4f}, factor: {auto_factor:.4f})")
 
 
-                # 모든 GPU가 동일한 auto_factor를 갖도록 동기화
-                if count >= calibration_steps:
-                    factor_tensor = torch.tensor(auto_factor).to(device)
-                    if dist.is_available() and dist.is_initialized():
-                        dist.broadcast(factor_tensor, src=0)
-                    auto_factor = factor_tensor.item()
-
-                if (batch_idx + 1) % 1000 == 0 and accelerator.is_main_process:
+                if (batch_idx + 1) % 300 == 0 and accelerator.is_main_process:
                     self._save_checkpoint(unwrapped_model, save_dir)
                     torch.cuda.empty_cache()
 
         except Exception as e:
-            if accelerator.is_main_process:
-                print(f"Error!!! : {e}")
-                traceback.print_exc()
+            rank = accelerator.process_index
+            print(f"[RANK {rank}] Error!!! : {e}", flush=True)
+            traceback.print_exc()
+            raise
 
         finally:
             if accelerator.is_main_process:
                 wandb.finish()
                 print(f"\n>>> Finalizing: Swapping Student with Teacher (EMA) for Inference...")
-                
                 unwrapped_model = accelerator.unwrap_model(model)
                 unwrapped_model.load_state_dict(ema_teacher.model.state_dict())
-
                 self._save_checkpoint(unwrapped_model, final_save_dir)
                 print(f">>> [DONE] Final Teacher model saved to: {final_save_dir}")
                 torch.cuda.empty_cache()
@@ -859,7 +923,6 @@ class StabilityEvaluator():
                     ],
                 )
                 return response.choices[0].message.content.strip()
-
             elif "gemini" in self.model_name.lower(): 
                 response = self.client.models.generate_content(
                     model=self.model_name,
@@ -867,11 +930,7 @@ class StabilityEvaluator():
                     config={'temperature': 0.0, 'max_output_tokens': 16}
                 )
                 return response.text.strip()   
-
         return ""
-
-
-
 
     def run_evaluation(self, perturbation_type, limit=None):
         raw_logs = []
@@ -949,6 +1008,154 @@ class StabilityEvaluator():
         finally:
             return pd.DataFrame(raw_logs)
 
+
+def get_prediction_multi(self, model, image, question):
+        import torch
+
+        device = next(model.parameters()).device
+        refined_question = f"{question}\nAnswer the question concisely with a single word or a short phrase."
+        
+        if self.model_type == 'open_source':
+            if 'qwen' in self.model_name.lower():
+                messages = [{"role": "user", "content": [
+                    {"type": "image", "image": image},
+                    {"type": "text", "text": refined_question}
+                ]}]
+                text = self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+                image_inputs, video_inputs = process_vision_info(messages)
+                inputs = self.processor(
+                    text=[text], images=image_inputs, videos=video_inputs,
+                    padding=True, return_tensors="pt"
+                )
+            elif 'phi' in self.model_name.lower():
+                prompt = f"<|image_1|>\n<|user|>\n{refined_question}<|end|>\n<|assistant|>\n"
+                inputs = self.processor(text=prompt, images=image, return_tensors="pt")
+            else:
+                prompt = f"USER: <image>\n{refined_question}\nASSISTANT:"
+                inputs = self.processor(text=prompt, images=image, return_tensors="pt")
+
+            for k, v in inputs.items():
+                if isinstance(v, torch.Tensor):
+                    inputs[k] = v.to(device, non_blocking=True)
+
+            with torch.no_grad():
+                generated_ids = model.generate(**inputs, 
+                                               max_new_tokens=20, 
+                                               do_sample=False, 
+                                               use_cache=True
+                                               )
+
+            input_token_len = inputs["input_ids"].shape[1]
+            generated_ids_trimmed = [out_ids[input_token_len:] for out_ids in generated_ids]
+            final_output = self.processor.batch_decode(
+                generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
+            )[0].strip()
+
+            del inputs, generated_ids
+            # torch.cuda.empty_cache()
+            return final_output
+
+        else:
+            if "gpt" in self.model_name.lower():
+                response = self.client.chat.completions.create(
+                    model=self.model,
+                    messages=[{"role": "user", "content": [
+                        {"type": "text", "text": refined_question},
+                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image}"}}
+                    ]}],
+                )
+                return response.choices[0].message.content.strip()
+            elif "gemini" in self.model_name.lower():
+                response = self.client.models.generate_content(
+                    model=self.model_name,
+                    contents=[refined_question, image],
+                    config={'temperature': 0.0, 'max_output_tokens': 16}
+                )
+                return response.text.strip()
+        return ""
+
+
+    def run_evaluation_multi(self, perturbation_type="visual", limit=None):
+        import torch.distributed as dist
+
+        raw_logs = []
+        df = self.samples_df.head(limit) if limit else self.samples_df
+
+        # rank별 데이터 분할
+        if dist.is_available() and dist.is_initialized():
+            world_size = dist.get_world_size()
+            rank = dist.get_rank()
+            df = df.iloc[rank::world_size].reset_index(drop=True)
+
+        self.model.eval()
+        self.model.config.use_cache = True
+
+        for i, row in tqdm(df.iterrows(), total=len(df), desc=self.model_name):
+            try:
+                if not row['image'] or len(str(row['image'])) < 100:
+                    continue
+
+                img_data = base64.b64decode(row['image'])
+                img = Image.open(BytesIO(img_data)).convert('RGB')
+                question = row['question']
+                gt = str(row['answer']).lower()
+                is_sensitive_label = row['rotation_label']
+
+                orig_input = self._encode_image(img) if 'gpt' in self.model_name.lower() else img
+                orig_pred = self.get_prediction_multi(self.model, orig_input, question)
+                orig_clean = self._clean_text(orig_pred)
+                orig_entropy, orig_dist, orig_avg_acc, orig_is_stable = \
+                    self.calculate_entropy([gt], gt)
+
+                all_preds_for_entropy = [orig_pred]
+                temp_results = [{
+                    "p_name": "original", "pred": orig_pred,
+                    "is_stable": orig_is_stable, "orig_entropy": orig_entropy,
+                    "orig_dist": orig_dist, "orig_avg_acc": orig_avg_acc
+                }]
+
+                p_map = get_perturbation_map(img)
+                for p_name, p_img in p_map.items():
+                    input_img = self._encode_image(p_img) if 'gpt' in self.model_name.lower() else p_img
+                    pred = self.get_prediction_multi(self.model, input_img, question)
+                    all_preds_for_entropy.append(pred)
+                    temp_results.append({
+                        "p_name": p_name, "pred": pred,
+                        "is_stable": (self._clean_text(pred) == orig_clean)
+                    })
+
+                entropy, dist_log, avg_acc, is_stable = \
+                    self.calculate_entropy(all_preds_for_entropy, gt)
+
+                for res in temp_results:
+                    raw_logs.append({
+                        "image_id": row['index'],
+                        "p_name": res['p_name'],
+                        "prediction": res['pred'],
+                        "ground_truth": gt,
+                        "is_correct": (self._clean_text(res['pred']) == self._clean_text(gt)),
+                        "is_stable": is_stable,
+                        "is_rotation_sensitive": is_sensitive_label,
+                        "sample_entropy": entropy,
+                        "sample_avg_acc": avg_acc,
+                        "dist_log": str(dist_log)
+                    })
+
+                torch.cuda.empty_cache()
+
+            except Exception as e:
+                print(f"Error at index {i}: {e}")
+                import traceback
+                traceback.print_exc()
+                torch.cuda.empty_cache()
+                continue
+
+        result_df = pd.DataFrame(raw_logs)
+        return result_df
+
+
+
+    
     def _clean_text(self, text):
         if not text:
             return ""
